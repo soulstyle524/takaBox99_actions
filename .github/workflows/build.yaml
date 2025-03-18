@@ -1,136 +1,89 @@
-name: Android CI - Ultimate
+name: Android Stable Build
 
 on:
-  workflow_dispatch:
-  push:
-    branches: [ main ]
-
-env:
-  GRADLE_VERSION: 7.6.1
-  KOTLIN_VERSION: 1.7.20
-  JAVA_VERSION: 11
+  workflow_dispatch: # 允许手动触发
 
 jobs:
-  build:
+  android-build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 30 # 防止卡死
+
     steps:
-      # ------------------- 环境准备阶段 -------------------
-      - name: Checkout with Submodules
+      # --------------------- 第1步：代码检出 ---------------------
+      - name: Checkout Code
         uses: actions/checkout@v4
         with:
-          submodules: recursive  # 确保子模块依赖完整
-          fetch-depth: 0
+          fetch-depth: 1 # 只拉取最新提交加速克隆
 
-      - name: Validate Project Structure
-        run: |
-          [ -f project-to-build ] || { echo "::error::project-to-build 文件缺失"; exit 1; }
-          [ -d project ] || echo "::notice::未检测到预克隆项目"
-
-      # ------------------- 环境配置阶段 -------------------
-      - name: Setup Java Ecosystem
+      # --------------------- 第2步：Java环境 ---------------------
+      - name: Setup Java 11
         uses: actions/setup-java@v3
         with:
-          java-version: ${{ env.JAVA_VERSION }}
-          distribution: temurin
-          cache: 'gradle'
-          check-latest: true
+          distribution: 'temurin'
+          java-version: '11'
+          cache: 'gradle' # 启用缓存加速
 
-      - name: Configure Gradle Wrapper
-        run: |
-          ./gradlew wrapper --gradle-version $GRADLE_VERSION --distribution-type bin
-          chmod +x gradlew
-          ./gradlew --version
-
-      # ------------------- 项目克隆阶段 -------------------
+      # --------------------- 第3步：克隆目标仓库 ---------------------
       - name: Clone Target Project
-        id: clone
+        env:
+          PROJECT_URL: https://github.com/soulstyle524/TVBoxOSC-.git # 替换为你的实际URL
         run: |
-          PROJECT_URL=$(tr -d '\n\r' < project-to-build)
-          CLONE_DIR="project-$(date +%s)"
-          
-          git clone \
-            --depth 1 \
-            --branch main \
-            --single-branch \
-            "$PROJECT_URL" "$CLONE_DIR" || exit 1
-          
-          echo "CLONE_DIR=$CLONE_DIR" >> $GITHUB_ENV
-          echo "project_path=$CLONE_DIR" >> $GITHUB_OUTPUT
+          # 防错1：检查URL有效性
+          if [[ ! $PROJECT_URL =~ ^https://github.com/.*\.git$ ]]; then
+            echo "::error::项目URL格式错误: $PROJECT_URL"
+            exit 1
+          fi
 
-      # ------------------- 构建加固阶段 -------------------
-      - name: Apply Critical Fixes
-        working-directory: ${{ env.CLONE_DIR }}
+          # 防错2：避免重复克隆
+          if [ -d "project" ]; then
+            rm -rf project
+          fi
+
+          git clone --depth 1 --branch main "$PROJECT_URL" project || {
+            echo "::error::仓库克隆失败，请检查权限或分支是否存在"
+            exit 1
+          }
+
+      # --------------------- 第4步：修复模块权限 ---------------------
+      - name: Fix Java Module Access
+        working-directory: ./project
         run: |
-          # 修复 Java 模块访问限制
-          sed -i '/org.gradle.jvmargs/d' gradle.properties
-          echo "org.gradle.jvmargs=--add-opens java.base/java.io=ALL-UNNAMED --add-opens java.base/sun.nio.ch=ALL-UNNAMED" >> gradle.properties
+          # 允许反射访问核心模块
+          echo "org.gradle.jvmargs=--add-opens java.base/java.io=ALL-UNNAMED" >> gradle.properties
+          echo "org.gradle.jvmargs=--add-opens java.base/java.lang=ALL-UNNAMED" >> gradle.properties
 
-          # 强制 Kotlin 版本一致性
-          sed -i "s/kotlin_version=.*/kotlin_version=$KOTLIN_VERSION/" gradle.properties
-          [ -f build.gradle.kts ] && sed -i "s/id(\"org.jetbrains.kotlin.android\") version \".*\"/id(\"org.jetbrains.kotlin.android\") version \"$KOTLIN_VERSION\"/" build.gradle.kts
-
-      # ------------------- 依赖解析阶段 -------------------
-      - name: Resolve Dependencies
-        working-directory: ${{ env.CLONE_DIR }}
+      # --------------------- 第5步：Gradle缓存清理 ---------------------
+      - name: Clean Gradle Cache
         run: |
-          ./gradlew --no-daemon --stacktrace \
-            -Pandroid.experimental.enableNewResourceProcessing=true \
-            dependencies || {
-              echo "::error::依赖解析失败，查看以下可能的问题："
-              echo "1. 检查仓库镜像配置"
-              echo "2. 验证代理设置"
+          # 防止旧缓存导致构建失败
+          rm -rf ~/.gradle/caches/
+          rm -rf ./project/.gradle/
+
+      # --------------------- 第6步：构建调试 ---------------------
+      - name: Build with Debug Mode
+        working-directory: ./project
+        run: |
+          # 确保gradlew可执行
+          chmod +x gradlew || true
+
+          # 生成调试日志文件
+          ./gradlew assembleDebug \
+            --stacktrace \
+            --no-daemon \
+            --scan \ # 生成详细报告
+            --debug > build.log 2>&1 || {
+              echo "::error::构建失败，查看日志摘要:"
+              grep -iE 'error|fail|exception' build.log
               exit 1
             }
 
-      # ------------------- 构建执行阶段 -------------------
-      - name: Safe Build
-        working-directory: ${{ env.CLONE_DIR }}
-        run: |
-          # 分阶段构建便于问题定位
-          ./gradlew --no-daemon --stacktrace \
-            clean \
-            :app:preBuild \
-            :app:generateDebugSources \
-            :app:kaptGenerateStubsDebugKotlin \
-            :app:kaptDebugKotlin \
-            :app:compileDebugKotlin \
-            :app:compileDebugJavaWithJavac || exit 1
-
-          # 完整构建
-          ./gradlew --no-daemon --stacktrace \
-            -Porg.gradle.parallel=false \
-            -Pkapt.use.worker.api=false \
-            assembleDebug
-
-      # ------------------- 产物处理阶段 -------------------
-      - name: Archive Artifacts
+      # --------------------- 第7步：上传产物 ---------------------
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: apk-${{ github.run_id }}
+          name: release-apk
           path: |
-            ${{ env.CLONE_DIR }}/**/build/outputs/**/*.apk
-            ${{ env.CLONE_DIR }}/build/reports/**/*.html
-          retention-days: 7
-
-      - name: Build Summary
-        if: always()
-        uses: actions/github-script@v6
-        with:
-          script: |
-            const fs = require('fs');
-            let report = '## 构建质量报告\n\n';
-            
-            try {
-              const depReport = fs.readFileSync('${{ env.CLONE_DIR }}/build/reports/dependencies.txt', 'utf8');
-              report += `### 依赖分析\n\`\`\`\n${depReport}\n\`\`\`\n`;
-            } catch (e) {
-              report += '⚠️ 依赖分析报告不可用\n';
-            }
-            
-            github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: report
-            });
+            ./project/**/build/outputs/apk/**/*.apk
+            ./project/build.log # 包含完整日志
+          if-no-files-found: error # 无文件时报错
+          retention-days: 3
